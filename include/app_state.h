@@ -14,11 +14,11 @@ typedef struct {
 } detection_t;
 
 typedef struct {
-    volatile int   valid;
-    volatile float cx, cy;      /* 归一化 screen 中心 [0,1] */
-    volatile float w, h;        /* 归一化 bbox 宽高 */
-    volatile int   class_id;
-    volatile int   track_id;
+    int   valid;
+    float cx, cy;      /* 归一化 screen 中心 [0,1] */
+    float w, h;        /* 归一化 bbox 宽高 */
+    int   class_id;
+    int   track_id;
 } predict_box_t;
 
 typedef enum {
@@ -50,6 +50,9 @@ typedef struct {
     /* 每个帧缓冲对应的 offset 快照 */
     frame_offset_t frame_offsets[FRAME_BUF_CNT];
 
+    /* 预测框互斥锁 */
+    pthread_mutex_t pred_mutex;
+
     /* 跟踪预测框 (tracker 每帧更新 @30fps) */
     predict_box_t pred_box;
 
@@ -80,6 +83,7 @@ extern "C" {
 
 extern app_state_t g_state;
 extern uint8_t *g_frame_pool[FRAME_BUF_CNT];
+extern uint8_t *g_cached_pool[FRAME_BUF_CNT];
 
 void app_state_init(app_state_t *s);
 

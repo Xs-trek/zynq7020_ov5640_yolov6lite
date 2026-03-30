@@ -32,6 +32,15 @@ int jpeg_init(void)
         return -1;
     }
     
+    /* 预分配全局 g_state 的 jpeg_buf */
+    g_state.jpeg_buf = (uint8_t *)malloc(tj_buf_size);
+    if (!g_state.jpeg_buf) {
+        fprintf(stderr, "[jpeg] Failed to allocate g_state.jpeg_buf\n");
+        free(tj_buf);
+        tjDestroy(tj_handle);
+        return -1;
+    }
+
     printf("[jpeg] Encoder initialized (TurboJPEG + NEON), buf=%lu bytes\n", tj_buf_size);
     return 0;
 }
@@ -64,10 +73,7 @@ int jpeg_encode_frame(const uint8_t *rgb_data)
 
     /* 重新分配并拷贝（避免共享 tj_buf） */
     if (g_state.jpeg_buf) {
-        free(g_state.jpeg_buf);
-    }
-    g_state.jpeg_buf = (uint8_t *)malloc(jpeg_size);
-    if (g_state.jpeg_buf) {
+        // 在 init 里分配的大小是最大的 tj_buf_size，所以这里不会越界
         memcpy(g_state.jpeg_buf, tj_buf, jpeg_size);
         g_state.jpeg_size = jpeg_size;
         g_state.jpeg_seq = g_state.frame_seq;

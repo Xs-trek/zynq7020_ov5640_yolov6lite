@@ -24,8 +24,9 @@ extern "C" {
 /* ── 全局状态 ── */
 app_state_t g_state;
 uint8_t *g_frame_pool[FRAME_BUF_CNT];
+uint8_t *g_cached_pool[FRAME_BUF_CNT];
 
-/* P3.2: 全局 tracker 实例 */
+/* 全局 tracker 实例 */
 tracker_t g_tracker;
 
 void app_state_init(app_state_t *s)
@@ -50,6 +51,7 @@ void app_state_init(app_state_t *s)
     pthread_mutex_init(&s->det_mutex, NULL);
     pthread_mutex_init(&s->cmd_mutex, NULL);
     pthread_mutex_init(&s->settings_mutex, NULL);
+    pthread_mutex_init(&s->pred_mutex, NULL);
 
     s->jpeg_buf = NULL;
     s->jpeg_size = 0;
@@ -120,6 +122,11 @@ int main(int argc, char *argv[])
             fprintf(stderr, "[main] Failed to map frame buffer %d\n", i);
             return 1;
         }
+        g_cached_pool[i] = (uint8_t *)malloc(FRAME_SIZE);
+        if (!g_cached_pool[i]) {
+            fprintf(stderr, "[main] Failed to alloc cached pool %d\n", i);
+            return 1;
+        }
         printf("[main] Frame pool[%d] mapped: phys=0x%08X\n", i, fb_phys[i]);
     }
 
@@ -177,6 +184,8 @@ int main(int argc, char *argv[])
     for (int i = 0; i < FRAME_BUF_CNT; i++) {
         if (g_frame_pool[i])
             mmio_unmap((volatile void *)g_frame_pool[i], FRAME_SIZE);
+        if (g_cached_pool[i]) 
+            free(g_cached_pool[i]);
     }
     mmio_close();
 
@@ -184,6 +193,7 @@ int main(int argc, char *argv[])
     pthread_mutex_destroy(&g_state.det_mutex);
     pthread_mutex_destroy(&g_state.cmd_mutex);
     pthread_mutex_destroy(&g_state.settings_mutex);
+    pthread_mutex_destroy(&g_state.pred_mutex);
     if (g_state.jpeg_buf) free(g_state.jpeg_buf);
 
     printf("[main] Clean exit\n");

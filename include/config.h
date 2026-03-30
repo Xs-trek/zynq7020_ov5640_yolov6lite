@@ -1,4 +1,4 @@
-/* config.h — V6-P3 全局硬件常量与配置 */
+/* config.h — 全局硬件常量与配置 */
 #ifndef CONFIG_H
 #define CONFIG_H
 

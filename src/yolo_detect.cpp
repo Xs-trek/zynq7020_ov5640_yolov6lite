@@ -208,8 +208,8 @@ void *yolo_thread(void *arg)
             continue;
         }
 
-        int frame_idx = g_state.latest_frame_idx;
-        unsigned int cur_seq = g_state.frame_seq;
+        int frame_idx = __atomic_load_n(&g_state.latest_frame_idx, __ATOMIC_ACQUIRE);
+        unsigned int cur_seq = __atomic_load_n(&g_state.frame_seq, __ATOMIC_ACQUIRE);
         if (frame_idx < 0 || cur_seq == last_seq) {
             usleep(5000);
             continue;
@@ -220,7 +220,7 @@ void *yolo_thread(void *arg)
         int snap_xoff = g_state.frame_offsets[frame_idx].xoff;
         int snap_yoff = g_state.frame_offsets[frame_idx].yoff;
 
-        uint8_t *rgb_data = g_frame_pool[frame_idx];
+        uint8_t *rgb_data = g_cached_pool[frame_idx];
         if (!rgb_data) continue;
 
         double t0 = get_time_ms();

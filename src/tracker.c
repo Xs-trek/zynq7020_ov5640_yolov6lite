@@ -471,14 +471,18 @@ void tracker_update_detections(tracker_t *trk,
 void tracker_predict(tracker_t *trk, float time_sec)
 {
     if (trk->state == TRACK_STATE_IDLE) {
+        pthread_mutex_lock(&g_state.pred_mutex);
         g_state.pred_box.valid = 0;
+        pthread_mutex_unlock(&g_state.pred_mutex);
         return;
     }
 
     if (trk->startup_frames > 0) {
         trk->startup_frames--;
         trk->last_predict_time = time_sec;
+        pthread_mutex_lock(&g_state.pred_mutex);
         g_state.pred_box.valid = 0;
+        pthread_mutex_unlock(&g_state.pred_mutex);
         return;
     }
 
@@ -528,6 +532,7 @@ void tracker_predict(tracker_t *trk, float time_sec)
         float raw_cx = (target_sub_x - view_ox) / (float)IMG_W;
         float raw_cy = (target_sub_y - view_oy) / (float)IMG_H;
 
+        pthread_mutex_lock(&g_state.pred_mutex);
         g_state.pred_box.cx = 1.0f - raw_cx;
         g_state.pred_box.cy = 1.0f - raw_cy;
         g_state.pred_box.w  = trk->select_bbox_w;
@@ -535,6 +540,7 @@ void tracker_predict(tracker_t *trk, float time_sec)
         g_state.pred_box.class_id = trk->target_class;
         g_state.pred_box.track_id = trk->target_id;
         g_state.pred_box.valid = 1;
+        pthread_mutex_unlock(&g_state.pred_mutex);
     }
 
     /* 每 2 秒诊断 */
@@ -580,7 +586,9 @@ void tracker_stop(tracker_t *trk)
     isp_written_this_frame = 0;
     tracker_write_isp_offset(ISP_DEFAULT_XOFF, ISP_DEFAULT_YOFF);
 
+    pthread_mutex_lock(&g_state.pred_mutex);
     g_state.pred_box.valid = 0;
+    pthread_mutex_unlock(&g_state.pred_mutex);
 
     g_state.tracking_active = 0;
     g_state.tracking_target_id = -1;

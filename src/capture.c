@@ -84,10 +84,11 @@ void *capture_thread(void *arg)
         }
 
         int completed_idx = write_idx;
-        g_state.latest_frame_idx = completed_idx;
-        g_state.frame_seq++;
+        memcpy(g_cached_pool[completed_idx], g_frame_pool[completed_idx], FRAME_SIZE);
+        __atomic_store_n(&g_state.latest_frame_idx, completed_idx, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&g_state.frame_seq, 1, __ATOMIC_RELEASE);
 
-        jpeg_encode_frame(g_frame_pool[completed_idx]);
+        jpeg_encode_frame(g_cached_pool[completed_idx]);
 
         write_idx = (write_idx + 1) % FRAME_BUF_CNT;
         if (write_idx == g_state.latest_frame_idx)

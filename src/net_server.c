@@ -24,7 +24,7 @@
 #include <arpa/inet.h>
 
 /* ── WebSocket 辅助 ── */
-#include <openssl/sha.h>  /* 如果没有 openssl，用 third_party/sha1 替代 */
+#include <openssl/sha.h>
 
 /* ── COCO 类名 ── */
 static const char *coco_names_tbl[80] = {
@@ -89,6 +89,8 @@ typedef struct {
     char recv_buf[4096];
     int recv_len;
     int ws_handshake_done;
+    uint8_t *mjpeg_buf;        /* 专属于这个客户端的推流缓冲区 */
+    size_t mjpeg_buf_cap;      /* 缓冲区最大容量 */
 } client_t;
 
 static int listen_fd = -1;
@@ -105,6 +107,11 @@ static void set_nonblock(int fd)
 static void client_remove(int idx)
 {
     if (idx < 0 || idx >= client_count) return;
+    /* 客户端断开时，回收专属缓冲区 */
+    if (clients[idx].mjpeg_buf) {
+        free(clients[idx].mjpeg_buf);
+        clients[idx].mjpeg_buf = NULL;
+    }
     close(clients[idx].fd);
     clients[idx] = clients[client_count - 1];
     client_count--;
@@ -116,7 +123,14 @@ static int send_all(int fd, const void *buf, size_t len)
     size_t sent = 0;
     while (sent < len) {
         ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
-        if (n <= 0) return -1;
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(5000); 
+                continue;
+            }           
+            return -1; 
+        }
+        if (n == 0) return -1;
         sent += n;
     }
     return 0;
@@ -125,6 +139,9 @@ static int send_all(int fd, const void *buf, size_t len)
 /* ── MJPEG 帧发送 ── */
 static int send_mjpeg_frame(client_t *c)
 {
+    /* 该客户端未成功分配缓冲区，放弃帧发送 */
+    if (!c->mjpeg_buf) return 0; 
+
     pthread_mutex_lock(&g_state.jpeg_mutex);
     if (!g_state.jpeg_buf || g_state.jpeg_size == 0 ||
         g_state.jpeg_seq == c->last_jpeg_seq) {
@@ -134,16 +151,12 @@ static int send_mjpeg_frame(client_t *c)
 
     /* 拷贝 JPEG 数据 */
     size_t sz = g_state.jpeg_size;
-    uint8_t *tmp = malloc(sz);
-    if (!tmp) {
-        pthread_mutex_unlock(&g_state.jpeg_mutex);
-        return -1;
-    }
-    memcpy(tmp, g_state.jpeg_buf, sz);
+    if (sz > c->mjpeg_buf_cap) sz = c->mjpeg_buf_cap;
+    memcpy(c->mjpeg_buf, g_state.jpeg_buf, sz);
     c->last_jpeg_seq = g_state.jpeg_seq;
     pthread_mutex_unlock(&g_state.jpeg_mutex);
 
-    /* multipart header */
+    /* 组装 HTTP 头 */
     char hdr[256];
     int hlen = snprintf(hdr, sizeof(hdr),
         "\r\n--%s\r\n"
@@ -153,10 +166,9 @@ static int send_mjpeg_frame(client_t *c)
 
     int ret = 0;
     if (send_all(c->fd, hdr, hlen) < 0 ||
-        send_all(c->fd, tmp, sz) < 0) {
+        send_all(c->fd, c->mjpeg_buf, sz) < 0) {
         ret = -1;
     }
-    free(tmp);
     return ret;
 }
 
@@ -229,6 +241,14 @@ static void handle_http_request(client_t *c)
         if (send_all(c->fd, resp, strlen(resp)) == 0) {
             c->type = CLIENT_MJPEG;
             c->last_jpeg_seq = 0;
+            /* 当且仅当客户端请求视频流时，分配一次固定内存 */
+            c->mjpeg_buf_cap = 640 * 480 * 3; 
+            c->mjpeg_buf = (uint8_t *)malloc(c->mjpeg_buf_cap);
+            if (!c->mjpeg_buf) {
+                // 内存真爆了
+                printf("[net] Warning: mjpeg_buf malloc failed!\n");
+            }
+
         }
 
     } else if (strncmp(req, "GET /api/status", 15) == 0) {
@@ -457,6 +477,9 @@ int net_server_run(void)
 
     /* 清理 */
     for (int i = 0; i < client_count; i++) {
+        if (clients[i].mjpeg_buf) {
+            free(clients[i].mjpeg_buf);
+        }
         close(clients[i].fd);
     }
     client_count = 0;
@@ -515,13 +538,24 @@ void net_ws_broadcast_detections(void)
     pos += snprintf(json + pos, sizeof(json) - pos, "]");
 
     /* 追加预测框 */
-    if (g_state.pred_box.valid) {
-        float pcx = g_state.pred_box.cx;
-        float pcy = g_state.pred_box.cy;
-        float pw  = g_state.pred_box.w;
-        float ph  = g_state.pred_box.h;
-        int   pid = g_state.pred_box.track_id;
-        int   pcls = g_state.pred_box.class_id;
+    int   pvalid;
+    float pcx, pcy, pw, ph;
+    int   pid, pcls;
+
+    pthread_mutex_lock(&g_state.pred_mutex);
+    pvalid = g_state.pred_box.valid;
+    if (pvalid) {
+        pcx  = g_state.pred_box.cx;
+        pcy  = g_state.pred_box.cy;
+        pw   = g_state.pred_box.w;
+        ph   = g_state.pred_box.h;
+        pid  = g_state.pred_box.track_id;
+        pcls = g_state.pred_box.class_id;
+    }
+    pthread_mutex_unlock(&g_state.pred_mutex);
+
+    /* 使用局部变量进行后续耗时的查表、浮点计算和字符串格式化 */
+    if (pvalid) {
         const char *pname = coco_names_lookup(pcls);
 
         /* 转为像素坐标 (x,y,w,h) 与 detections 格式一致 */
