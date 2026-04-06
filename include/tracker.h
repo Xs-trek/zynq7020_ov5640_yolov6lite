@@ -83,6 +83,7 @@ void tracker_stop(tracker_t *trk);
 void tracker_reset_frame_flag(void);
 void tracker_get_isp_offset(int *xoff, int *yoff);
 void tracker_write_isp_offset(int x, int y);
+void tracker_update_optical_flow(tracker_t *trk, float abs_x, float abs_y, float time_sec);
 
 /* 调参 (保留接口) */
 void tracker_tune(tracker_t *trk, const char *key, float value);

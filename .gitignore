@@ -5,3 +5,7 @@ build/
 *.so
 *.out
 *.d
+
+# 三方库
+third_party/opencv/
+opencv/

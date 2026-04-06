@@ -112,6 +112,23 @@ static void ab_update(ab_estimator_t *e, float obs_ox, float obs_oy)
     e->vy += AB_BETA_RATE * ry;
 }
 
+static void ab_update_gain(ab_estimator_t *e, float obs_ox, float obs_oy,
+                           float alpha, float beta_rate)
+{
+    if (!e->initialized) {
+        ab_start(e, obs_ox, obs_oy);
+        return;
+    }
+
+    float rx = obs_ox - e->ox;
+    float ry = obs_oy - e->oy;
+
+    e->ox += alpha * rx;
+    e->oy += alpha * ry;
+    e->vx += beta_rate * rx;
+    e->vy += beta_rate * ry;
+}
+
 /* ═══════════════════════════════════════
  * 二阶临界阻尼执行层
  * ═══════════════════════════════════════ */
@@ -411,7 +428,7 @@ void tracker_update_detections(tracker_t *trk,
         int obs_ox, obs_oy;
         sub_to_offset(sub_x, sub_y, &obs_ox, &obs_oy);
 
-        ab_update(&trk->est, (float)obs_ox, (float)obs_oy);
+        // ab_update(&trk->est, (float)obs_ox, (float)obs_oy);
 
         trk->last_seen_time = time_sec;
         sm_push(trk, 1);
@@ -600,4 +617,24 @@ void tracker_tune(tracker_t *trk, const char *key, float val)
 {
     (void)trk;
     printf("[tune] %s=%.4f (fixed params)\n", key, val);
+}
+
+void tracker_update_optical_flow(tracker_t *trk, float abs_x, float abs_y, float time_sec)
+{
+    if (trk->state == TRACK_STATE_IDLE || trk->target_id < 0)
+        return;
+
+    if (trk->startup_frames > 0)
+        return;
+
+    /* 将当前帧 sub 空间绝对坐标转换为 offset 观测 */
+    int obs_ox, obs_oy;
+    sub_to_offset(abs_x, abs_y, &obs_ox, &obs_oy);
+
+    /* 光流作为高频观测源补充 AB，使用专用低增益抑制细微抖动 */
+    ab_update_gain(&trk->est, (float)obs_ox, (float)obs_oy,
+                   OF_AB_ALPHA, OF_AB_BETA_RATE);
+
+    /* 不更新 last_sub_x / last_sub_y，保持其语义为“最近一次 YOLO 真值” */
+    trk->last_seen_time = time_sec;
 }

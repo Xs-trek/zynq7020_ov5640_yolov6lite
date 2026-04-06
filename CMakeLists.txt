@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD 11)
 
 set(NCNN_DIR      "$ENV{HOME}/ncnn/build-arm/install")
 set(JPEGTURBO_DIR "$ENV{HOME}/workdir/libjpeg-turbo/build-arm/install")
+set(OpenCV_DIR    "${CMAKE_SOURCE_DIR}/third_party/opencv/lib/cmake/opencv4")
+find_package(OpenCV REQUIRED)
 
 include_directories(
     ${CMAKE_SOURCE_DIR}/include
@@ -13,6 +15,7 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/third_party
     ${NCNN_DIR}/include
     ${JPEGTURBO_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
 )
 
 link_directories(
@@ -36,6 +39,7 @@ set(C_SOURCES
 set(CXX_SOURCES
     src/main.cpp
     src/yolo_detect.cpp
+    src/optical_flow.cpp
 )
 
 add_executable(cam_system ${C_SOURCES} ${CXX_SOURCES})
@@ -43,6 +47,7 @@ add_executable(cam_system ${C_SOURCES} ${CXX_SOURCES})
 target_link_libraries(cam_system
     ncnn
     turbojpeg
+    ${OpenCV_LIBS}
     ssl
     crypto
     pthread

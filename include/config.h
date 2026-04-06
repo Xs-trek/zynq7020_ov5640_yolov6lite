@@ -99,6 +99,9 @@
 #define AB_ALPHA            0.9f      /* 位置修正增益 */
 #define AB_BETA_RATE        1.71f     /* 速度修正增益 (1/s, 频率无关) */
 
+#define OF_AB_ALPHA         0.45f
+#define OF_AB_BETA_RATE     0.85f
+
 /* 二阶临界阻尼执行层 */
 #define DAMP_OMEGA          8.0f      /* 自然频率 (rad/s) */
 
