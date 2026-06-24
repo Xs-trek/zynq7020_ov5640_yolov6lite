@@ -1,0 +1,5 @@
+# Copy this file to authorized_keys outside the public repository or pass
+# CAM_SSH_AUTHORIZED_KEYS=/path/to/authorized_keys when staging ssh-access-dev.
+#
+# Example:
+# ssh-ed25519 AAAA... user@example

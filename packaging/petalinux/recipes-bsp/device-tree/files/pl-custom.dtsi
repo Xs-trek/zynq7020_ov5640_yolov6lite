@@ -1,0 +1,6 @@
+/* Add PL custom nodes for pl.dtsi generated from the base XSA file.
+ * Changes in this file only matter when FPGA manager/device-tree overlay is
+ * enabled.
+ */
+/ {
+};

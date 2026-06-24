@@ -1,0 +1,16 @@
+# 编译产物
+/build/
+*.o
+*.a
+*.so
+*.out
+*.d
+logs/serial_*.log
+logs/
+
+# 三方库
+third_party/opencv/
+opencv/
+
+# Local-only access credentials and generated release worktrees
+packaging/petalinux/recipes-apps/ssh-access-dev/files/authorized_keys

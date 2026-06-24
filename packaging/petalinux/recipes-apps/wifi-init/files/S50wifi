@@ -1,0 +1,420 @@
+#!/bin/sh
+
+IFACE="${IFACE:-wlan0}"
+MODULE_NAME="${MODULE_NAME:-8812bu}"
+WPA_CONF="${WPA_CONF:-/tmp/wifi-init.wpa.conf}"
+WPA_RUN_DIR="${WPA_RUN_DIR:-/var/run/wpa_supplicant}"
+BOOT_DEV="${BOOT_DEV:-/dev/mmcblk0p1}"
+BOOT_MOUNT="${BOOT_MOUNT:-/run/media/boot}"
+WIFI_COUNTRY="${WIFI_COUNTRY:-CN}"
+WIFI_INTERACTIVE="${WIFI_INTERACTIVE:-0}"
+IFACE_WAIT_SECS="${IFACE_WAIT_SECS:-10}"
+WPA_WAIT_SECS="${WPA_WAIT_SECS:-25}"
+WIFI_CONFIG_SOURCE=""
+BOOT_MOUNTED=0
+BOOT_CONFIG_DIRS=""
+
+CONFIG_FILES="${WIFI_CONFIG:-/etc/wifi-init.conf /etc/wifi.conf}"
+
+log()
+{
+    echo "wifi-init: $*"
+}
+
+warn()
+{
+    echo "wifi-init: $*" >&2
+}
+
+restore_tty()
+{
+    stty echo 2>/dev/null || true
+}
+
+cleanup_boot_mount()
+{
+    if [ "$BOOT_MOUNTED" = "1" ]; then
+        umount "$BOOT_MOUNT" 2>/dev/null || true
+        BOOT_MOUNTED=0
+    fi
+}
+
+add_boot_config_dir()
+{
+    dir="$1"
+    [ -d "$dir" ] || return 0
+
+    case " $BOOT_CONFIG_DIRS " in
+        *" $dir "*)
+            ;;
+        *)
+            BOOT_CONFIG_DIRS="${BOOT_CONFIG_DIRS}${BOOT_CONFIG_DIRS:+ }$dir"
+            ;;
+    esac
+}
+
+cleanup_runtime()
+{
+    rm -f "$WPA_CONF" "$WPA_CONF".*
+    cleanup_boot_mount
+}
+
+module_loaded()
+{
+    grep -qw "^${MODULE_NAME}" /proc/modules
+}
+
+find_module()
+{
+    for path in /lib/modules/*/extra/"${MODULE_NAME}".ko /lib/modules/extra/"${MODULE_NAME}".ko; do
+        [ -f "$path" ] || continue
+        printf '%s\n' "$path"
+        return 0
+    done
+    return 1
+}
+
+load_driver()
+{
+    if module_loaded; then
+        return 0
+    fi
+
+    if command -v modprobe >/dev/null 2>&1; then
+        modprobe "$MODULE_NAME" 2>/dev/null || true
+        if module_loaded; then
+            return 0
+        fi
+    fi
+
+    module_path="$(find_module)" || {
+        warn "module not found: ${MODULE_NAME}.ko"
+        return 1
+    }
+
+    insmod "$module_path" rtw_drv_log_level=0 2>/dev/null || {
+        warn "failed to load module: $module_path"
+        return 1
+    }
+}
+
+wait_for_iface()
+{
+    count=0
+    while [ "$count" -lt "$IFACE_WAIT_SECS" ]; do
+        [ -d "/sys/class/net/$IFACE" ] && return 0
+        sleep 1
+        count=$((count + 1))
+    done
+    warn "interface not found: $IFACE"
+    return 1
+}
+
+iface_up()
+{
+    ifconfig "$IFACE" up 2>/dev/null || ip link set "$IFACE" up 2>/dev/null || true
+}
+
+mount_boot_config()
+{
+    boot_base="${BOOT_DEV##*/}"
+
+    add_boot_config_dir "$BOOT_MOUNT"
+    add_boot_config_dir "/run/media/$boot_base"
+    add_boot_config_dir "/media/$boot_base"
+    add_boot_config_dir /mnt
+
+    while read -r dev mountpoint rest; do
+        [ "$dev" = "$BOOT_DEV" ] || continue
+        add_boot_config_dir "$mountpoint"
+        return 0
+    done < /proc/mounts
+
+    [ -b "$BOOT_DEV" ] || return 1
+    grep -q "[[:space:]]${BOOT_MOUNT}[[:space:]]" /proc/mounts 2>/dev/null && return 0
+
+    mkdir -p "$BOOT_MOUNT" || return 1
+    mount -t vfat -o ro "$BOOT_DEV" "$BOOT_MOUNT" 2>/dev/null || return 1
+    BOOT_MOUNTED=1
+    add_boot_config_dir "$BOOT_MOUNT"
+}
+
+valid_passphrase()
+{
+    [ "${#1}" -ge 8 ] && [ "${#1}" -le 63 ]
+}
+
+valid_psk()
+{
+    [ "${#1}" -eq 64 ] || return 1
+    case "$1" in
+        *[!0123456789abcdefABCDEF]*)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+escape_wpa_string()
+{
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+write_wpa_from_passphrase()
+{
+    ssid="$1"
+    passphrase="$2"
+    tmp_conf="${WPA_CONF}.$$"
+
+    {
+        echo "ctrl_interface=${WPA_RUN_DIR}"
+        echo "country=${WIFI_COUNTRY}"
+        echo "update_config=0"
+        wpa_passphrase "$ssid" "$passphrase" | grep -v '^[[:space:]]*#psk='
+    } > "$tmp_conf" || {
+        rm -f "$tmp_conf"
+        return 1
+    }
+
+    chmod 600 "$tmp_conf"
+    mv "$tmp_conf" "$WPA_CONF"
+}
+
+write_wpa_from_psk()
+{
+    ssid="$(escape_wpa_string "$1")"
+    psk="$2"
+    tmp_conf="${WPA_CONF}.$$"
+
+    {
+        echo "ctrl_interface=${WPA_RUN_DIR}"
+        echo "country=${WIFI_COUNTRY}"
+        echo "update_config=0"
+        echo "network={"
+        printf '\tssid="%s"\n' "$ssid"
+        printf '\tpsk=%s\n' "$psk"
+        echo "}"
+    } > "$tmp_conf" || {
+        rm -f "$tmp_conf"
+        return 1
+    }
+
+    chmod 600 "$tmp_conf"
+    mv "$tmp_conf" "$WPA_CONF"
+}
+
+read_kv_config()
+{
+    config_file="$1"
+    [ -r "$config_file" ] || return 1
+
+    ssid=""
+    passphrase=""
+    psk=""
+    cr="$(printf '\r')"
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%"$cr"}"
+        case "$line" in
+            ''|\#*)
+                ;;
+            SSID=*)
+                ssid="${line#SSID=}"
+                ;;
+            PASSPHRASE=*)
+                passphrase="${line#PASSPHRASE=}"
+                ;;
+            PASSWORD=*)
+                passphrase="${line#PASSWORD=}"
+                ;;
+            PSK=*)
+                psk="${line#PSK=}"
+                ;;
+        esac
+    done < "$config_file"
+
+    if [ -z "$ssid" ]; then
+        warn "ignoring config without SSID: $config_file"
+        return 1
+    fi
+
+    if valid_psk "$psk"; then
+        write_wpa_from_psk "$ssid" "$psk" || return 1
+    elif valid_passphrase "$passphrase"; then
+        write_wpa_from_passphrase "$ssid" "$passphrase" || return 1
+    else
+        warn "ignoring config without valid PSK/passphrase: $config_file"
+        return 1
+    fi
+
+    WIFI_CONFIG_SOURCE="$config_file"
+    log "using config: $config_file"
+    return 0
+}
+
+load_wifi_config()
+{
+    mount_boot_config || true
+
+    for config_file in $CONFIG_FILES; do
+        if read_kv_config "$config_file"; then
+            cleanup_boot_mount
+            return 0
+        fi
+    done
+
+    for config_dir in $BOOT_CONFIG_DIRS; do
+        for config_name in wifi-init.conf wifi.conf; do
+            if read_kv_config "$config_dir/$config_name"; then
+                cleanup_boot_mount
+                return 0
+            fi
+        done
+    done
+
+    cleanup_boot_mount
+    return 1
+}
+
+prompt_wifi_config()
+{
+    while :; do
+        printf "SSID: "
+        IFS= read -r ssid
+        [ -n "$ssid" ] || {
+            warn "SSID must not be empty"
+            continue
+        }
+
+        printf "Password: "
+        trap restore_tty INT TERM EXIT
+        stty -echo 2>/dev/null || true
+        IFS= read -r passphrase
+        restore_tty
+        trap - INT TERM EXIT
+        echo ""
+
+        valid_passphrase "$passphrase" || {
+            warn "password must be 8..63 characters"
+            unset passphrase
+            continue
+        }
+
+        if write_wpa_from_passphrase "$ssid" "$passphrase"; then
+            unset passphrase
+            WIFI_CONFIG_SOURCE="prompt"
+            return 0
+        fi
+
+        unset passphrase
+        warn "failed to create wpa_supplicant config"
+    done
+}
+
+wait_for_wpa()
+{
+    count=0
+    while [ "$count" -lt "$WPA_WAIT_SECS" ]; do
+        wpa_cli -i "$IFACE" status 2>/dev/null | grep -q '^wpa_state=COMPLETED' && return 0
+        sleep 1
+        count=$((count + 1))
+    done
+    warn "association did not complete within ${WPA_WAIT_SECS}s"
+    return 1
+}
+
+start_supplicant()
+{
+    mkdir -p "$WPA_RUN_DIR"
+    wpa_supplicant -B -i "$IFACE" -c "$WPA_CONF"
+}
+
+connect_wifi()
+{
+    start_supplicant || return 1
+    wait_for_wpa
+}
+
+start_wifi()
+{
+    log "starting"
+    load_driver || return 1
+    wait_for_iface || return 1
+    iface_up
+
+    killall udhcpc 2>/dev/null || true
+    killall wpa_supplicant 2>/dev/null || true
+    cleanup_runtime
+
+    if ! load_wifi_config; then
+        [ "$WIFI_INTERACTIVE" = "1" ] || {
+            warn "no valid config; run WIFI_INTERACTIVE=1 /etc/init.d/S50wifi restart for serial prompt"
+            return 1
+        }
+        prompt_wifi_config || return 1
+    fi
+
+    if ! connect_wifi; then
+        killall wpa_supplicant 2>/dev/null || true
+        cleanup_runtime
+        if [ "$WIFI_INTERACTIVE" = "1" ] && [ "$WIFI_CONFIG_SOURCE" != "prompt" ]; then
+            warn "configured network failed, falling back to serial prompt"
+            prompt_wifi_config || return 1
+            connect_wifi || {
+                killall wpa_supplicant 2>/dev/null || true
+                cleanup_runtime
+                return 1
+            }
+        else
+            return 1
+        fi
+    fi
+
+    cleanup_runtime
+    udhcpc -i "$IFACE" &
+}
+
+stop_wifi()
+{
+    log "stopping"
+    killall udhcpc 2>/dev/null || true
+    killall wpa_supplicant 2>/dev/null || true
+    cleanup_runtime
+}
+
+status_wifi()
+{
+    if module_loaded; then
+        log "module loaded"
+    else
+        log "module not loaded"
+    fi
+
+    if [ -d "/sys/class/net/$IFACE" ]; then
+        ifconfig "$IFACE" 2>/dev/null || ip addr show "$IFACE" 2>/dev/null || true
+        wpa_cli -i "$IFACE" status 2>/dev/null || true
+    else
+        warn "interface not found: $IFACE"
+        return 1
+    fi
+}
+
+case "$1" in
+    start)
+        start_wifi
+        ;;
+    stop)
+        stop_wifi
+        ;;
+    restart)
+        stop_wifi
+        start_wifi
+        ;;
+    status)
+        status_wifi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

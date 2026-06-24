@@ -1,0 +1,98 @@
+#!/bin/sh
+
+DAEMON="${DAEMON:-/usr/sbin/cam-launcher}"
+PID_DIR="${PID_DIR:-/run/cam-system}"
+PID_FILE="${PID_FILE:-${PID_DIR}/cam-launcher.pid}"
+LOG_FILE="${LOG_FILE:-/tmp/cam-launcher.log}"
+
+is_running()
+{
+    [ -s "$PID_FILE" ] || return 1
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    case "$pid" in
+        ""|*[!0-9]*)
+            return 1
+            ;;
+    esac
+
+    [ -d "/proc/$pid" ] || return 1
+
+    if [ -r "/proc/$pid/comm" ]; then
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+        [ "$comm" = "cam-launcher" ] || return 1
+    fi
+
+    return 0
+}
+
+start()
+{
+    mkdir -p "$PID_DIR"
+
+    if is_running; then
+        echo "cam-launcher: already running"
+        return 0
+    fi
+
+    if [ ! -x "$DAEMON" ]; then
+        echo "cam-launcher: missing daemon $DAEMON" >&2
+        return 1
+    fi
+
+    CAM_LAUNCHER_EVENT_NAME="${CAM_LAUNCHER_EVENT_NAME:-gpio-keys}" \
+    CAM_LAUNCHER_KEY_CODE="${CAM_LAUNCHER_KEY_CODE:-148}" \
+    CAM_LAUNCHER_CAM_BINARY="${CAM_LAUNCHER_CAM_BINARY:-/usr/bin/cam_system}" \
+        "$DAEMON" >> "$LOG_FILE" 2>&1 &
+    echo "$!" > "$PID_FILE"
+    echo "cam-launcher: started"
+}
+
+stop()
+{
+    if ! is_running; then
+        rm -f "$PID_FILE"
+        echo "cam-launcher: stopped"
+        return 0
+    fi
+
+    pid="$(cat "$PID_FILE")"
+    kill "$pid" 2>/dev/null || true
+
+    i=0
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 2 ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    rm -f "$PID_FILE"
+    echo "cam-launcher: stopped"
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    status)
+        if is_running; then
+            echo "cam-launcher: running"
+        else
+            echo "cam-launcher: stopped"
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

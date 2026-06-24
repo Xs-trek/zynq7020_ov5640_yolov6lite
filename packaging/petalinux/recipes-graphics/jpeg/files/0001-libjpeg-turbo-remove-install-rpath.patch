@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cam_system <local>
+Date: Wed, 3 Jun 2026 00:00:00 +0800
+Subject: [PATCH] libjpeg-turbo: remove install rpath
+
+Yocto QA reports /usr/lib install RPATH as useless-rpaths.  The
+PetaLinux 2022.2 core libjpeg-turbo recipe carries the same oe-specific
+fix for the older 2.1.1 recipe; keep the behavior for the local 3.1.4
+recipe instead of disabling QA.
+
+Upstream-Status: Inappropriate [oe-specific]
+---
+ CMakeLists.txt | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -306,10 +306,6 @@ endif()
+ report_option(ENABLE_SHARED "Shared libraries")
+ report_option(ENABLE_STATIC "Static libraries")
+ 
+-if(ENABLE_SHARED)
+-  set(CMAKE_INSTALL_RPATH ${CMAKE_INSTALL_FULL_LIBDIR})
+-endif()
+-
+ if(WITH_JPEG8 OR WITH_JPEG7)
+   set(WITH_ARITH_ENC 1)
+   set(WITH_ARITH_DEC 1)
+-- 
+2.37.2

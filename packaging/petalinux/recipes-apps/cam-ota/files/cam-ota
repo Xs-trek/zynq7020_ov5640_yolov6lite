@@ -1,0 +1,599 @@
+#!/bin/sh
+set -eu
+
+BOOT_DEV="${CAM_OTA_BOOT_DEV:-/dev/mmcblk0p1}"
+BOOT_MOUNT="${CAM_OTA_BOOT_MOUNT:-/run/media/boot}"
+BOOT_DIR="${CAM_OTA_BOOT_DIR:-}"
+FIT_LOAD_ADDR="${CAM_OTA_FIT_LOAD_ADDR:-0x10000000}"
+UENV_LOAD_ADDR="${CAM_OTA_UENV_LOAD_ADDR:-0x02080000}"
+UENV_VERIFY_ADDR="${CAM_OTA_UENV_VERIFY_ADDR:-0x03000000}"
+BOOTARGS_BASE="${CAM_OTA_BOOTARGS_BASE:-console=ttyPS0,115200 earlycon root=/dev/ram0 rw}"
+WDT_TIMEOUT="${CAM_OTA_WDT_TIMEOUT:-60000}"
+WDT_ENABLED="${CAM_OTA_WDT_ENABLED:-1}"
+WATCHDOG_DEV="${CAM_OTA_WATCHDOG_DEV:-/dev/watchdog}"
+KEEPALIVE_SECS="${CAM_OTA_KEEPALIVE_SECS:-10}"
+OTA_DIR="ota"
+STATE_DIR="${OTA_DIR}/state"
+STATE_FILE="${STATE_DIR}/current.env"
+UENV_FILE="uEnv.txt"
+HOOK_TEXT="${STATE_DIR}/uEnv.txt"
+ROLLBACK_HOOK_TEXT="${STATE_DIR}/uEnv.rollback"
+MOUNTED_BY_US=0
+
+log()
+{
+    echo "cam-ota: $*"
+}
+
+warn()
+{
+    echo "cam-ota: $*" >&2
+}
+
+die()
+{
+    warn "$*"
+    exit 1
+}
+
+cleanup()
+{
+    if [ "$MOUNTED_BY_US" = "1" ] && [ -n "$BOOT_DIR" ]; then
+        umount "$BOOT_DIR" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT
+
+usage()
+{
+    cat <<'EOF'
+Usage: cam-ota <command> [args]
+
+Commands:
+  init
+      Create slot_a from /image.ub and initialize the U-Boot uEnv.txt hook.
+  status
+      Print boot cmdline, OTA state, slots and boot hook status.
+  state
+      Print only the persisted OTA state.
+  install <image.ub> [version]
+      Verify and install image.ub to the inactive slot, then mark it pending.
+  mark-good [version]
+      Mark the currently booted slot good and clear the rollback hook.
+  rollback
+      Switch bootloader state back to the previous slot.
+  disable
+      Remove the OTA boot hook and rollback hook; default /image.ub boots.
+  verify
+      Check boot partition OTA files without changing state.
+  watchdog-keepalive
+      Feed /dev/watchdog until killed; used by bootguard during pending boot.
+  watchdog-stop
+      Stop the watchdog keepalive and issue a magic close when possible.
+EOF
+}
+
+find_mounted_boot()
+{
+    while read -r dev mountpoint rest; do
+        if [ "$dev" = "$BOOT_DEV" ]; then
+            BOOT_DIR="$mountpoint"
+            return 0
+        fi
+    done < /proc/mounts
+    return 1
+}
+
+ensure_boot_dir()
+{
+    if [ -n "${CAM_OTA_BOOT_DIR:-}" ]; then
+        BOOT_DIR="$CAM_OTA_BOOT_DIR"
+        [ -d "$BOOT_DIR" ] || die "CAM_OTA_BOOT_DIR is not a directory: $BOOT_DIR"
+        return 0
+    fi
+
+    if find_mounted_boot; then
+        return 0
+    fi
+
+    [ -b "$BOOT_DEV" ] || die "boot device not found: $BOOT_DEV"
+    mkdir -p "$BOOT_MOUNT"
+    mount -t vfat -o rw "$BOOT_DEV" "$BOOT_MOUNT"
+    BOOT_DIR="$BOOT_MOUNT"
+    MOUNTED_BY_US=1
+}
+
+mount_boot_rw()
+{
+    ensure_boot_dir
+    if [ -z "${CAM_OTA_BOOT_DIR:-}" ]; then
+        mount -o remount,rw "$BOOT_DIR" 2>/dev/null || true
+    fi
+    mkdir -p "$BOOT_DIR/$OTA_DIR" "$BOOT_DIR/$STATE_DIR"
+}
+
+mount_boot_ro()
+{
+    ensure_boot_dir
+}
+
+slot_relpath()
+{
+    case "$1" in
+        a) echo "$OTA_DIR/slot_a/image.ub" ;;
+        b) echo "$OTA_DIR/slot_b/image.ub" ;;
+        *) die "invalid slot: $1" ;;
+    esac
+}
+
+slot_dir()
+{
+    case "$1" in
+        a) echo "$OTA_DIR/slot_a" ;;
+        b) echo "$OTA_DIR/slot_b" ;;
+        *) die "invalid slot: $1" ;;
+    esac
+}
+
+other_slot()
+{
+    case "$1" in
+        a) echo b ;;
+        b) echo a ;;
+        *) die "invalid slot: $1" ;;
+    esac
+}
+
+sha256_file()
+{
+    sha256sum "$1" | awk '{print $1}'
+}
+
+file_size()
+{
+    wc -c < "$1" | tr -d ' '
+}
+
+state_get()
+{
+    key="$1"
+    file="$BOOT_DIR/$STATE_FILE"
+    [ -r "$file" ] || return 1
+    sed -n "s/^${key}=//p" "$file" | tail -n 1
+}
+
+cmdline_get()
+{
+    key="$1"
+    for item in $(cat /proc/cmdline 2>/dev/null || true); do
+        case "$item" in
+            "$key="*)
+                echo "${item#*=}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+current_slot()
+{
+    slot="$(cmdline_get cam_ota_slot 2>/dev/null || true)"
+    case "$slot" in
+        a|b) echo "$slot"; return 0 ;;
+    esac
+
+    slot="$(state_get active_slot 2>/dev/null || true)"
+    case "$slot" in
+        a|b) echo "$slot"; return 0 ;;
+    esac
+
+    echo a
+}
+
+previous_slot()
+{
+    slot="$(state_get previous_slot 2>/dev/null || true)"
+    case "$slot" in
+        a|b) echo "$slot"; return 0 ;;
+    esac
+    other_slot "$(current_slot)"
+}
+
+write_state()
+{
+    active="$1"
+    previous="$2"
+    state="$3"
+    version="$4"
+    image_rel="$(slot_relpath "$active")"
+    image_abs="$BOOT_DIR/$image_rel"
+    tmp="$BOOT_DIR/$STATE_FILE.tmp"
+    sha="missing"
+    size="0"
+
+    if [ -f "$image_abs" ]; then
+        sha="$(sha256_file "$image_abs")"
+        size="$(file_size "$image_abs")"
+    fi
+
+    {
+        echo "active_slot=$active"
+        echo "previous_slot=$previous"
+        echo "state=$state"
+        echo "version=$version"
+        echo "image=$image_rel"
+        echo "image_sha256=$sha"
+        echo "image_size=$size"
+    } > "$tmp"
+    mv "$tmp" "$BOOT_DIR/$STATE_FILE"
+}
+
+write_slot_manifest()
+{
+    slot="$1"
+    version="$2"
+    slotdir="$BOOT_DIR/$(slot_dir "$slot")"
+    image="$slotdir/image.ub"
+    [ -f "$image" ] || die "slot image missing: $image"
+
+    {
+        echo "slot=$slot"
+        echo "version=$version"
+        echo "image=image.ub"
+        echo "image_sha256=$(sha256_file "$image")"
+        echo "image_size=$(file_size "$image")"
+    } > "$slotdir/manifest.env.tmp"
+    mv "$slotdir/manifest.env.tmp" "$slotdir/manifest.env"
+}
+
+bootargs_for()
+{
+    slot="$1"
+    state="$2"
+    previous="$3"
+
+    echo "$BOOTARGS_BASE cam_ota_slot=$slot cam_ota_state=$state cam_ota_prev_slot=$previous"
+}
+
+generate_uenv_text()
+{
+    slot="$1"
+    previous="$2"
+    state="$3"
+    upgrade="$4"
+    out="$5"
+    image_rel="$(slot_relpath "$slot")"
+    previous_rel="$(slot_relpath "$previous")"
+    bootargs="$(bootargs_for "$slot" "$state" "$previous")"
+    rollback_bootargs="$(bootargs_for "$previous" rollback "$previous")"
+    baseline_bootargs="$BOOTARGS_BASE"
+
+    {
+        echo "ota_slot=$slot"
+        echo "ota_prev_slot=$previous"
+        echo "ota_state=$state"
+        echo "ota_image=$image_rel"
+        echo "bootargs=$bootargs"
+        if [ "$upgrade" = "1" ]; then
+            printf 'uenvcmd=setenv bootargs %s; setenv ota_rollback_armed 0; echo Arming OTA rollback hook: %s; if fatload ${devtype} ${devnum}:${distro_bootpart} %s %s; then setenv ota_rollback_size ${filesize}; if fatwrite ${devtype} ${devnum}:${distro_bootpart} %s %s ${ota_rollback_size}; then if fatload ${devtype} ${devnum}:${distro_bootpart} %s %s; then if test "${filesize}" = "${ota_rollback_size}"; then setenv ota_rollback_armed 1; echo OTA rollback hook armed and verified; else echo OTA rollback hook size mismatch; fi; else echo OTA rollback hook verify load failed; fi; else echo OTA rollback hook write failed; fi; else echo OTA rollback hook missing; fi; if test "${ota_rollback_armed}" = "1"; then echo Loading pending OTA slot %s: %s; if fatload ${devtype} ${devnum}:${distro_bootpart} %s %s; then if iminfo %s; then if test "%s" = "1"; then if wdt dev watchdog@f8005000; then wdt start %s; fi; fi; setenv bootargs %s; echo Booting pending OTA slot %s: %s; bootm %s; else echo OTA pending image failed iminfo; fi; else echo OTA pending image load failed; fi; fi; setenv bootargs %s; echo Falling back to OTA slot %s: %s; if fatload ${devtype} ${devnum}:${distro_bootpart} %s %s; then if iminfo %s; then bootm %s; else echo OTA rollback image failed iminfo; fi; fi; setenv bootargs %s; setenv fitimage_name image.ub\n' \
+                "$baseline_bootargs" "$ROLLBACK_HOOK_TEXT" "$UENV_LOAD_ADDR" "$ROLLBACK_HOOK_TEXT" \
+                "$UENV_LOAD_ADDR" "$UENV_FILE" "$UENV_VERIFY_ADDR" "$UENV_FILE" \
+                "$slot" "$image_rel" "$FIT_LOAD_ADDR" "$image_rel" "$FIT_LOAD_ADDR" "$WDT_ENABLED" "$WDT_TIMEOUT" \
+                "$bootargs" "$slot" "$image_rel" "$FIT_LOAD_ADDR" \
+                "$rollback_bootargs" "$previous" "$previous_rel" "$FIT_LOAD_ADDR" "$previous_rel" "$FIT_LOAD_ADDR" "$FIT_LOAD_ADDR" "$baseline_bootargs"
+        else
+            printf 'uenvcmd=setenv bootargs %s; echo Loading OTA slot %s: %s; if fatload ${devtype} ${devnum}:${distro_bootpart} %s %s; then if iminfo %s; then setenv bootargs %s; echo Booting OTA slot %s: %s; bootm %s; else echo OTA image failed iminfo; fi; fi; echo OTA image load failed; setenv bootargs %s; setenv fitimage_name image.ub\n' \
+                "$baseline_bootargs" "$slot" "$image_rel" "$FIT_LOAD_ADDR" "$image_rel" "$FIT_LOAD_ADDR" \
+                "$bootargs" "$slot" "$image_rel" "$FIT_LOAD_ADDR" "$baseline_bootargs"
+        fi
+    } > "$out"
+}
+
+generate_rollback_uenv_text()
+{
+    rollback_slot="$1"
+    rollback_out="$2"
+    rollback_image_rel="$(slot_relpath "$rollback_slot")"
+    rollback_bootargs="$(bootargs_for "$rollback_slot" rollback "$rollback_slot")"
+    rollback_baseline_bootargs="$BOOTARGS_BASE"
+
+    {
+        echo "ota_slot=$rollback_slot"
+        echo "ota_prev_slot=$rollback_slot"
+        echo "ota_state=rollback"
+        echo "ota_image=$rollback_image_rel"
+        echo "bootargs=$rollback_bootargs"
+        printf 'uenvcmd=setenv bootargs %s; echo Loading rollback OTA slot %s: %s; if fatload ${devtype} ${devnum}:${distro_bootpart} %s %s; then if iminfo %s; then setenv bootargs %s; echo Rolling back to OTA slot %s: %s; bootm %s; else echo OTA rollback image failed iminfo; fi; fi; echo OTA rollback image load failed; setenv bootargs %s; setenv fitimage_name image.ub\n' \
+            "$rollback_baseline_bootargs" "$rollback_slot" "$rollback_image_rel" "$FIT_LOAD_ADDR" "$rollback_image_rel" "$FIT_LOAD_ADDR" \
+            "$rollback_bootargs" "$rollback_slot" "$rollback_image_rel" "$FIT_LOAD_ADDR" "$rollback_baseline_bootargs"
+    } > "$rollback_out"
+}
+
+clear_persistent_env()
+{
+    rm -f "$BOOT_DIR/uboot.env" "$BOOT_DIR/uboot-redund.env"
+}
+
+write_boot_hook()
+{
+    slot="$1"
+    previous="$2"
+    state="$3"
+    upgrade="$4"
+    hook_tmp="$BOOT_DIR/$STATE_DIR/uEnv.txt.tmp"
+    rollback_tmp="$BOOT_DIR/$STATE_DIR/uEnv.rollback.tmp"
+
+    mkdir -p "$BOOT_DIR/$STATE_DIR"
+    if [ "$upgrade" = "1" ]; then
+        generate_rollback_uenv_text "$previous" "$rollback_tmp"
+        mv "$rollback_tmp" "$BOOT_DIR/$ROLLBACK_HOOK_TEXT"
+    else
+        rm -f "$BOOT_DIR/$ROLLBACK_HOOK_TEXT" "$rollback_tmp"
+    fi
+    generate_uenv_text "$slot" "$previous" "$state" "$upgrade" "$hook_tmp"
+    cp "$hook_tmp" "$BOOT_DIR/$HOOK_TEXT"
+    cp "$hook_tmp" "$BOOT_DIR/$UENV_FILE.tmp"
+    sync
+    mv "$BOOT_DIR/$UENV_FILE.tmp" "$BOOT_DIR/$UENV_FILE"
+    rm -f "$hook_tmp"
+    sync
+}
+
+install_image_to_slot()
+{
+    src="$1"
+    slot="$2"
+    version="$3"
+    [ -f "$src" ] || die "image not found: $src"
+
+    dst_dir="$BOOT_DIR/$(slot_dir "$slot")"
+    mkdir -p "$dst_dir"
+    src_sha="$(sha256_file "$src")"
+    tmp="$dst_dir/image.ub.tmp"
+
+    cp "$src" "$tmp"
+    sync
+    dst_sha="$(sha256_file "$tmp")"
+    [ "$src_sha" = "$dst_sha" ] || {
+        rm -f "$tmp"
+        die "sha256 mismatch after copy to slot $slot"
+    }
+    mv "$tmp" "$dst_dir/image.ub"
+    sync
+    write_slot_manifest "$slot" "$version"
+}
+
+cmd_init()
+{
+    mount_boot_rw
+    [ -f "$BOOT_DIR/image.ub" ] || die "baseline /image.ub not found on boot partition"
+
+    mkdir -p "$BOOT_DIR/$(slot_dir a)" "$BOOT_DIR/$(slot_dir b)" "$BOOT_DIR/$STATE_DIR"
+    if [ ! -f "$BOOT_DIR/$(slot_relpath a)" ]; then
+        install_image_to_slot "$BOOT_DIR/image.ub" a "baseline"
+    else
+        write_slot_manifest a "baseline"
+    fi
+
+    clear_persistent_env
+    write_state a a good baseline
+    write_boot_hook a a good 0
+    log "initialized OTA uEnv.txt hook with slot_a as good"
+}
+
+cmd_install()
+{
+    image="${1:-}"
+    version="${2:-manual}"
+    [ -n "$image" ] || die "install requires image.ub path"
+    image_src="$image"
+    mount_boot_rw
+
+    [ -f "$BOOT_DIR/$UENV_FILE" ] && [ -f "$BOOT_DIR/$STATE_FILE" ] || die "OTA hook missing; run cam-ota init first"
+    state="$(state_get state 2>/dev/null || true)"
+    case "$state" in
+        good) ;;
+        pending) die "pending OTA already exists; run mark-good, rollback, or disable first" ;;
+        *) die "OTA state is not good: ${state:-missing}" ;;
+    esac
+    active_slot="$(current_slot)"
+    inactive_slot="$(other_slot "$active_slot")"
+    [ -f "$BOOT_DIR/$(slot_relpath "$active_slot")" ] || die "active slot image missing: $active_slot"
+
+    install_image_to_slot "$image" "$inactive_slot" "$version"
+    clear_persistent_env
+    write_state "$inactive_slot" "$active_slot" pending "$version"
+    write_boot_hook "$inactive_slot" "$active_slot" pending 1
+    log "installed $image_src to slot_$inactive_slot and marked pending"
+}
+
+cmd_mark_good()
+{
+    version="${1:-manual-good}"
+    mount_boot_rw
+    slot="$(cmdline_get cam_ota_slot 2>/dev/null || true)"
+    if [ -z "$slot" ]; then
+        [ "${CAM_OTA_ALLOW_STATE_MARK_GOOD:-0}" = "1" ] || die "cam_ota_slot missing from /proc/cmdline; reboot through OTA env before mark-good"
+        slot="$(current_slot)"
+    fi
+    case "$slot" in a|b) ;; *) die "cannot determine booted OTA slot" ;; esac
+    [ -f "$BOOT_DIR/$(slot_relpath "$slot")" ] || die "booted slot image missing: $slot"
+
+    watchdog_stop || true
+    clear_persistent_env
+    write_state "$slot" "$slot" good "$version"
+    write_boot_hook "$slot" "$slot" good 0
+    log "marked slot_$slot good"
+}
+
+cmd_rollback()
+{
+    mount_boot_rw
+    active="$(current_slot)"
+    target="$(previous_slot)"
+    [ "$target" != "$active" ] || target="$(other_slot "$active")"
+    [ -f "$BOOT_DIR/$(slot_relpath "$target")" ] || die "rollback target slot image missing: $target"
+
+    watchdog_stop || true
+    clear_persistent_env
+    write_state "$target" "$target" rollback manual-rollback
+    write_boot_hook "$target" "$target" rollback 0
+    log "selected slot_$target for rollback; reboot to apply"
+}
+
+cmd_disable()
+{
+    mount_boot_rw
+    watchdog_stop || true
+    clear_persistent_env
+    rm -f "$BOOT_DIR/$UENV_FILE" "$BOOT_DIR/$HOOK_TEXT" "$BOOT_DIR/$ROLLBACK_HOOK_TEXT" "$BOOT_DIR/$STATE_FILE"
+    sync
+    log "disabled OTA boot hook; default /image.ub will boot"
+}
+
+cmd_state()
+{
+    mount_boot_ro
+    state_get state 2>/dev/null || true
+}
+
+cmd_verify()
+{
+    mount_boot_ro
+    ok=1
+    for file in "$UENV_FILE" "$STATE_FILE" "$HOOK_TEXT"; do
+        if [ -f "$BOOT_DIR/$file" ]; then
+            log "found $file"
+        else
+            warn "missing $file"
+            ok=0
+        fi
+    done
+    state="$(state_get state 2>/dev/null || true)"
+    if [ "$state" = "pending" ]; then
+        if [ -f "$BOOT_DIR/$ROLLBACK_HOOK_TEXT" ]; then
+            log "found $ROLLBACK_HOOK_TEXT"
+        else
+            warn "missing $ROLLBACK_HOOK_TEXT"
+            ok=0
+        fi
+    fi
+    for file in uboot.env uboot-redund.env; do
+        if [ -f "$BOOT_DIR/$file" ]; then
+            warn "$file present; this should only happen during a pending boot attempt"
+        fi
+    done
+    for slot in a b; do
+        rel="$(slot_relpath "$slot")"
+        if [ -f "$BOOT_DIR/$rel" ]; then
+            log "slot_$slot image sha256 $(sha256_file "$BOOT_DIR/$rel")"
+        else
+            warn "missing slot_$slot image"
+        fi
+    done
+    [ "$ok" = "1" ] || return 1
+}
+
+cmd_status()
+{
+    mount_boot_ro
+    echo "cmdline: $(cat /proc/cmdline 2>/dev/null || true)"
+    echo "boot_dir: $BOOT_DIR"
+    if [ -r "$BOOT_DIR/$STATE_FILE" ]; then
+        echo "state:"
+        sed 's/^/  /' "$BOOT_DIR/$STATE_FILE"
+    else
+        echo "state: missing"
+    fi
+    for slot in a b; do
+        rel="$(slot_relpath "$slot")"
+        if [ -f "$BOOT_DIR/$rel" ]; then
+            echo "slot_$slot: present sha256=$(sha256_file "$BOOT_DIR/$rel") size=$(file_size "$BOOT_DIR/$rel")"
+        else
+            echo "slot_$slot: missing"
+        fi
+    done
+    for file in "$UENV_FILE" "$HOOK_TEXT" "$ROLLBACK_HOOK_TEXT" uboot.env uboot-redund.env; do
+        if [ -f "$BOOT_DIR/$file" ]; then
+            echo "$file: present size=$(file_size "$BOOT_DIR/$file")"
+        else
+            echo "$file: missing"
+        fi
+    done
+}
+
+watchdog_keepalive()
+{
+    [ -c "$WATCHDOG_DEV" ] || exit 0
+    exec 3>"$WATCHDOG_DEV" || exit 0
+    trap 'printf V >&3 2>/dev/null || true; exec 3>&-; exit 0' INT TERM EXIT
+    while :; do
+        printf . >&3 2>/dev/null || exit 0
+        sleep "$KEEPALIVE_SECS"
+    done
+}
+
+watchdog_stop()
+{
+    if [ -s /run/cam-ota/watchdog.pid ]; then
+        pid="$(cat /run/cam-ota/watchdog.pid 2>/dev/null || true)"
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+            sleep 1
+        fi
+        rm -f /run/cam-ota/watchdog.pid
+    fi
+
+    if [ -c "$WATCHDOG_DEV" ]; then
+        (
+            exec 3>"$WATCHDOG_DEV"
+            printf V >&3
+            exec 3>&-
+        ) 2>/dev/null || true
+    fi
+}
+
+cmd="${1:-}"
+case "$cmd" in
+    init)
+        cmd_init
+        ;;
+    status)
+        cmd_status
+        ;;
+    state)
+        cmd_state
+        ;;
+    install)
+        shift
+        cmd_install "$@"
+        ;;
+    mark-good)
+        shift
+        cmd_mark_good "$@"
+        ;;
+    rollback)
+        cmd_rollback
+        ;;
+    disable)
+        cmd_disable
+        ;;
+    verify)
+        cmd_verify
+        ;;
+    watchdog-keepalive)
+        watchdog_keepalive
+        ;;
+    watchdog-stop)
+        watchdog_stop
+        ;;
+    -h|--help|help|'')
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 1
+        ;;
+esac

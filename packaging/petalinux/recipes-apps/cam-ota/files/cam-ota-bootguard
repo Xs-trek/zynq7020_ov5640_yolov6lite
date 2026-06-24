@@ -1,0 +1,39 @@
+#!/bin/sh
+
+case "$1" in
+    start)
+        mkdir -p /run/cam-ota
+        case " $(cat /proc/cmdline 2>/dev/null) " in
+            *" cam_ota_state=pending "*)
+                if [ -c /dev/watchdog ] && [ ! -s /run/cam-ota/watchdog.pid ]; then
+                    /usr/sbin/cam-ota watchdog-keepalive &
+                    echo "$!" > /run/cam-ota/watchdog.pid
+                fi
+                ;;
+            *" cam_ota_state=rollback "*)
+                /usr/sbin/cam-ota mark-good rollback-recovered >/dev/null 2>&1 || true
+                ;;
+            *)
+                if [ "$(/usr/sbin/cam-ota state 2>/dev/null || true)" = "pending" ]; then
+                    /usr/sbin/cam-ota rollback >/dev/null 2>&1 || \
+                        /usr/sbin/cam-ota disable >/dev/null 2>&1 || true
+                fi
+                /usr/sbin/cam-ota watchdog-stop >/dev/null 2>&1 || true
+                ;;
+        esac
+        ;;
+    stop)
+        /usr/sbin/cam-ota watchdog-stop >/dev/null 2>&1 || true
+        ;;
+    restart)
+        "$0" stop
+        "$0" start
+        ;;
+    status)
+        /usr/sbin/cam-ota status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,161 @@
+/include/ "system-conf.dtsi"
+
+/ {
+    usb_phy0: phy0@e0002000 {
+        compatible = "ulpi-phy";
+        #phy-cells = <0>;
+        reg = <0xe0002000 0x1000>;
+        view-port = <0x0170>;
+        drv-vbus;
+    };
+
+    ov5640_xclk: ov5640-xclk {
+        compatible = "fixed-clock";
+        #clock-cells = <0>;
+        clock-frequency = <24000000>;
+    };
+
+    cam_ps_keys: gpio-keys {
+        compatible = "gpio-keys";
+        pinctrl-names = "default";
+        pinctrl-0 = <&pinctrl_ps_key1_default>;
+
+        ps-key1 {
+            label = "cam-ps-key1";
+            gpios = <&gpio0 10 1>;
+            linux,code = <148>;
+            debounce-interval = <20>;
+        };
+    };
+
+    reserved-memory {
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges;
+
+        framebuf_reserved: framebuffer@3F000000 {
+            compatible = "shared-dma-pool";
+            reg = <0x3F000000 0x01000000>;
+            no-map;
+        };
+
+    };
+
+    vcap_ov5640: video-cap {
+        compatible = "xlnx,video";
+        dmas = <&camera_v_frmbuf_wr_0 0>;
+        dma-names = "port0";
+        memory-region = <&framebuf_reserved>;
+
+        ports {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            port@0 {
+                reg = <0>;
+                direction = "input";
+
+                vcap_ov5640_in: endpoint {
+                    remote-endpoint = <&axis_subsetconv_out>;
+                };
+            };
+        };
+    };
+
+    axis_subsetconv: axis-subset-converter {
+        compatible = "xlnx,axis-subsetconv-1.1";
+
+        ports {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            port@0 {
+                reg = <0>;
+
+                axis_subsetconv_in: endpoint {
+                    remote-endpoint = <&dvp_bridge_out>;
+                };
+            };
+
+            port@1 {
+                reg = <1>;
+
+                axis_subsetconv_out: endpoint {
+                    remote-endpoint = <&vcap_ov5640_in>;
+                };
+            };
+        };
+    };
+};
+
+&pinctrl0 {
+    pinctrl_ps_key1_default: ps-key1-default {
+        mux {
+            groups = "gpio0_10_grp";
+            function = "gpio0";
+        };
+
+        conf {
+            pins = "MIO10";
+            bias-pull-up;
+        };
+    };
+};
+
+&usb0   { dr_mode = "host"; usb-phy = <&usb_phy0>; };
+&can0   { status = "disabled"; };
+&uart1  { status = "disabled"; };
+&gem1   { status = "disabled"; };
+&sdhci1 { status = "disabled"; };
+
+&amba_pl {
+    v_frmbuf_wr@43c10000   { status = "okay"; };
+
+    ov5640_to_lcd@43c00000 {
+        compatible = "cam-system,dvp-rgb565-rgb888-bridge", "xlnx,ov5640-to-lcd-1.0";
+        status = "okay";
+
+        ports {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            port@0 {
+                reg = <0>;
+
+                dvp_bridge_in: endpoint {
+                    remote-endpoint = <&cam_ov5640_out>;
+                };
+            };
+
+            port@1 {
+                reg = <1>;
+
+                dvp_bridge_out: endpoint {
+                    remote-endpoint = <&axis_subsetconv_in>;
+                };
+            };
+        };
+    };
+
+    i2c@41600000 {
+        clock-frequency = <100000>;
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        camera@3c {
+            compatible = "cam-system,ov5640-control";
+            reg = <0x3c>;
+            clocks = <&ov5640_xclk>;
+            clock-names = "xclk";
+            powerdown-gpios = <&gpio0 67 0>;
+            reset-gpios = <&gpio0 68 1>;
+
+            port {
+                cam_ov5640_out: endpoint {
+                    remote-endpoint = <&dvp_bridge_in>;
+                    bus-width = <8>;
+                };
+            };
+        };
+    };
+};

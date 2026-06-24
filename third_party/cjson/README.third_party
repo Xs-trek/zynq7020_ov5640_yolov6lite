@@ -1,0 +1,19 @@
+Name: cJSON
+Type: vendored third-party source
+Upstream: https://github.com/DaveGamble/cJSON
+Version: 1.7.19, as declared by cJSON.h
+License: MIT
+
+Files:
+- cJSON.c
+- cJSON.h
+
+Use:
+cJSON is compiled directly into cam_system for small JSON request and response
+handling in the network command path.
+
+Governance:
+- Keep the upstream license header intact.
+- Do not patch these files silently. If local changes become necessary, record
+  them in docs/THIRD_PARTY_COMPONENTS.md and treat this directory as a fork.
+- Recalculate file hashes after any update.
